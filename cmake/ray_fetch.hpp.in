@@ -1,0 +1,4 @@
+#pragma once
+#include <string_view>
+inline constexpr std::string_view xs_fetch_source=R"xsfetch(@XS_FETCH_HLSL@)xsfetch";
+inline constexpr std::string_view xs_visibility_source=R"xsvis(@XS_VISIBILITY_HLSL@)xsvis";

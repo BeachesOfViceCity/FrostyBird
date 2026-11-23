@@ -1,0 +1,10 @@
+LIBRARY d3d12_xs.dll
+EXPORTS
+    D3D12CreateDevice=d3d12.D3D12CreateDevice
+    D3D12SerializeRootSignature=d3d12.D3D12SerializeRootSignature
+    D3D12SerializeVersionedRootSignature=d3d12.D3D12SerializeVersionedRootSignature
+    D3D12XboxCreateDevice
+    D3D12XboxSetProcessDebugFlags
+    IID_ID3D12Device DATA
+    FrostyGetVideoDevice
+    FrostyMakeVideoSurface

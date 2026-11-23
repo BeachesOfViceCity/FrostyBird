@@ -1,0 +1,28 @@
+Retail package 1.20.1831.3754 / RX 6950 XT / Wine / local vkd3d-proton
+
+Source: build/street-surface-95/launch.log, debugger observation only
+FD3D12CommandContext::RHIRayTraceDispatch:
+  requested FRHIRayTracingShader SHA-1: 25022ab0b6f35658da664ed24474657d7e44dee6
+  number of ray-generation shaders in the bound title pipeline: 3
+  the title's lookup subsequently reaches SetRayTracingShaderResources with
+  no matching entry; no XS DispatchRays for this request was submitted.
+
+build/hwrt-package/ray-sha-index.tsv and build/gameplay-index/types.tsv:
+  Global[3754], FOcclusionRGS, permutation 22
+  native XS collection key: 7fb4b432781382ea, 39607 bytes, four modules
+  public entry: OcclusionRGS_b89afd3a.ss_0
+  continuations: .ss_1, .ss_2, .ss_3, .ss_4
+
+The earlier launch used the temporary isolation override
+r.RayTracing.ForceAllRayTracingEffects=0. The shipping function
+PrepareRayTracingShadows reads CVarForceAllRayTracingEffects before it
+collects any permutations and returns on zero. The observed dispatch still
+requests the shadow shader. This is a title-side table lookup, before the
+backend can bind or execute a translated shadow library.
+
+Separate executable: build/street-shadow-guard-check/radv.log
+  Retail shadow raygen launch guard: 35/35 lanes matched; 9 inside, 26 outside
+  This measures the actual initial dispatch-coordinate extraction, b0/b1
+  reads, offset conversion and four comparisons on a 7 x 5 DispatchRays.
+  The measurement library is not installed as a title shader. It does not
+  execute the full shadow program or establish a downtown frame.

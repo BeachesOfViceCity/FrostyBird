@@ -1,0 +1,275 @@
+diff --git a/dlls/mfplat/buffer.c b/dlls/mfplat/buffer.c
+index 2eb2f0b3b2e850fac7c72b97c0505238c01e97d3..32ec87cac69c787d80a93016a8a17028c349d09c 100644
+--- a/dlls/mfplat/buffer.c
++++ b/dlls/mfplat/buffer.c
+@@ -2275,6 +2275,16 @@ HRESULT WINAPI MFCreateDXGISurfaceBuffer(REFIID riid, IUnknown *surface, UINT su
+         return E_INVALIDARG;
+ }
+ 
++/* The Xbox entry point ignores the scanline-orientation argument for D3D12
++ * resources. Its other surface types use the ordinary five-argument ABI. */
++HRESULT WINAPI MFCreateDXGISurfaceBufferX(REFIID riid, IUnknown *surface, UINT subresource, BOOL bottom_up,
++        IMFMediaBuffer **buffer)
++{
++    if (!riid || !surface || !buffer) return E_POINTER;
++    return MFCreateDXGISurfaceBuffer(riid, surface, subresource,
++            IsEqualIID(riid, &IID_ID3D12Resource) ? FALSE : bottom_up, buffer);
++}
++
+ static unsigned int buffer_get_aligned_length(unsigned int length, unsigned int alignment)
+ {
+     length = (length + alignment) / alignment;
+diff --git a/dlls/mfplat/main.c b/dlls/mfplat/main.c
+index 53db5214c194066fb1f1ac72628477394d6918fa..228b89b4b1057ec679e20d129b3c3a43501ba913 100644
+--- a/dlls/mfplat/main.c
++++ b/dlls/mfplat/main.c
+@@ -9700,6 +9700,19 @@ HRESULT WINAPI MFCreateDXGIDeviceManager(UINT *token, IMFDXGIDeviceManager **man
+     return S_OK;
+ }
+ 
++/***********************************************************************
++ *      MFResetDXGIDeviceManagerX (mfplat.@)
++ */
++HRESULT WINAPI MFResetDXGIDeviceManagerX(IMFDXGIDeviceManager *manager, IUnknown *device, UINT token)
++{
++    TRACE("%p, %p, %u.\n", manager, device, token);
++
++    if (!manager)
++        return E_POINTER;
++
++    return IMFDXGIDeviceManager_ResetDevice(manager, device, token);
++}
++
+ /***********************************************************************
+  *      MFLockDXGIDeviceManager (mfplat.@)
+  */
+diff --git a/dlls/mfplat/mfplat.spec b/dlls/mfplat/mfplat.spec
+index 9f653d70df33f50e18d554a22a771e9d3c268f3a..f24fc7bb39ab867e80d64a7cf2ee694bd205c300 100644
+--- a/dlls/mfplat/mfplat.spec
++++ b/dlls/mfplat/mfplat.spec
+@@ -48,6 +48,7 @@
+ @ stdcall MFCreateD3D12SynchronizationObject(ptr ptr ptr)
+ @ stdcall MFCreateDXGIDeviceManager(ptr ptr)
+ @ stdcall MFCreateDXGISurfaceBuffer(ptr ptr long long ptr)
++@ stdcall MFCreateDXGISurfaceBufferX(ptr ptr long long ptr)
+ @ stdcall MFCreateDXSurfaceBuffer(ptr ptr long ptr)
+ @ stdcall MFCreateEventQueue(ptr)
+ @ stdcall MFCreateFile(long long long wstr ptr)
+@@ -148,6 +149,7 @@
+ @ stdcall MFRegisterLocalSchemeHandler(wstr ptr)
+ @ stdcall MFRegisterPlatformWithMMCSS(wstr ptr long) rtworkq.RtwqRegisterPlatformWithMMCSS
+ @ stdcall MFRemovePeriodicCallback(long) rtworkq.RtwqRemovePeriodicCallback
++@ stdcall MFResetDXGIDeviceManagerX(ptr ptr long)
+ @ stdcall MFScheduleWorkItem(ptr ptr int64 ptr)
+ @ stdcall MFScheduleWorkItemEx(ptr int64 ptr) rtworkq.RtwqScheduleWorkItem
+ @ stdcall MFSerializeAttributesToStream(ptr long ptr)
+diff --git a/dlls/ntdll/sync.c b/dlls/ntdll/sync.c
+index f4090d5ed23c6a46c1138da630971adc44576fed..5cf319bde28944f81e3c47efcde35559d6054222 100644
+--- a/dlls/ntdll/sync.c
++++ b/dlls/ntdll/sync.c
+@@ -511,35 +511,26 @@ void WINAPI RtlInitializeSRWLock( RTL_SRWLOCK *lock )
+ void WINAPI RtlAcquireSRWLockExclusive( RTL_SRWLOCK *lock )
+ {
+     union { RTL_SRWLOCK *rtl; struct srw_lock *s; LONG *l; } u = { lock };
++    union { struct srw_lock s; LONG l; } owned = { .s = { .exclusive_waiters = 1, .owners = 1 } };
+ 
++    if (!ReadNoFence( u.l ) && !InterlockedCompareExchange( u.l, owned.l, 0 )) return;
+     InterlockedExchangeAdd16( &u.s->exclusive_waiters, 2 );
+ 
+     for (;;)
+     {
+         union { struct srw_lock s; LONG l; } old, new;
+-        BOOL wait;
+-
+-        do
++        old.l = ReadAcquire( u.l );
++        if (old.s.owners)
+         {
+-            old.s = *u.s;
+-            new.s = old.s;
+-
+-            if (!old.s.owners)
+-            {
+-                /* Not locked exclusive or shared. We can try to grab it. */
+-                new.s.owners = 1;
+-                new.s.exclusive_waiters -= 2;
+-                new.s.exclusive_waiters |= 1;
+-                wait = FALSE;
+-            }
+-            else
+-            {
+-                wait = TRUE;
+-            }
+-        } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+-
+-        if (!wait) return;
+-        RtlWaitOnAddress( &u.s->owners, &new.s.owners, sizeof(short), NULL );
++            /* WaitOnAddress itself rechecks the value before parking. */
++            RtlWaitOnAddress( &u.s->owners, &old.s.owners, sizeof(short), NULL );
++            continue;
++        }
++        new = old;
++        new.s.owners = 1;
++        new.s.exclusive_waiters -= 2;
++        new.s.exclusive_waiters |= 1;
++        if (InterlockedCompareExchange( u.l, new.l, old.l ) == old.l) return;
+     }
+ }
+ 
+@@ -557,28 +548,15 @@ void WINAPI RtlAcquireSRWLockShared( RTL_SRWLOCK *lock )
+     for (;;)
+     {
+         union { struct srw_lock s; LONG l; } old, new;
+-        BOOL wait;
+-
+-        do
++        old.l = ReadAcquire( u.l );
++        if (old.s.exclusive_waiters)
+         {
+-            old.s = *u.s;
+-            new = old;
+-
+-            if (!old.s.exclusive_waiters)
+-            {
+-                /* Not locked exclusive, and no exclusive waiters.
+-                 * We can try to grab it. */
+-                ++new.s.owners;
+-                wait = FALSE;
+-            }
+-            else
+-            {
+-                wait = TRUE;
+-            }
+-        } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+-
+-        if (!wait) return;
+-        RtlWaitOnAddress( u.s, &new.s, sizeof(struct srw_lock), NULL );
++            RtlWaitOnAddress( u.s, &old.s, sizeof(struct srw_lock), NULL );
++            continue;
++        }
++        new = old;
++        ++new.s.owners;
++        if (InterlockedCompareExchange( u.l, new.l, old.l ) == old.l) return;
+     }
+ }
+ 
+@@ -626,7 +604,7 @@ void WINAPI RtlReleaseSRWLockShared( RTL_SRWLOCK *lock )
+         --new.s.owners;
+     } while (InterlockedCompareExchange( u.l, new.l, old.l ) != old.l);
+ 
+-    if (!new.s.owners)
++    if (!new.s.owners && new.s.exclusive_waiters)
+         RtlWakeAddressSingle( &u.s->owners );
+ }
+ 
+@@ -826,30 +804,33 @@ struct futex_entry
+     DWORD tid;
+ };
+ 
+-struct futex_queue
++struct DECLSPEC_ALIGN(64) futex_queue
+ {
+     struct list queue;
+     LONG lock;
+ };
+ 
+-static struct futex_queue futex_queues[256];
++static struct futex_queue futex_queues[1024];
+ 
+ static struct futex_queue *get_futex_queue( const void *addr )
+ {
+-    ULONG_PTR val = (ULONG_PTR)addr;
++    ULONG_PTR val = (ULONG_PTR)addr >> 3;
+ 
+-    return &futex_queues[(val >> 4) % ARRAY_SIZE(futex_queues)];
++    /* Fixed-offset locks in different page-aligned objects are unrelated. */
++    val ^= val >> 10;
++    val ^= val >> 20;
++    return &futex_queues[val % ARRAY_SIZE(futex_queues)];
+ }
+ 
+ static void spin_lock( LONG *lock )
+ {
+     while (InterlockedCompareExchange( lock, -1, 0 ))
+-        YieldProcessor();
++        while (ReadNoFence( lock )) YieldProcessor();
+ }
+ 
+ static void spin_unlock( LONG *lock )
+ {
+-    InterlockedExchange( lock, 0 );
++    WriteRelease( lock, 0 );
+ }
+ 
+ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index f980e330f49b109baec38dd6f76d3ec7b1891815..0f7ed0df61242cdf1d70ac93a0aeabcfb7025a23 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -909,13 +909,16 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+ 
+     vprot_word = word_from_byte * *vprot;
+     mask_word = word_from_byte * mask;
+-    for (; curr_idx < end_idx; curr_idx += sizeof(UINT_PTR), vprot_ptr += sizeof(UINT_PTR))
++    while (curr_idx < end_idx)
+     {
+ #ifdef _WIN64
+         if (!(curr_idx & pages_vprot_mask) && !(vprot_ptr = pages_vprot[curr_idx >> pages_vprot_shift]))
+         {
+             if (*vprot & mask) return (curr_idx - start_idx) << page_shift;
++            /* An unallocated table represents all zero protections. Resume
++             * at the next table, without reading or advancing its null pointer. */
+             curr_idx += pages_vprot_mask + 1;
++            continue;
+         }
+ #endif
+         if ((vprot_word ^ *(UINT_PTR *)vprot_ptr) & mask_word)
+@@ -924,6 +927,8 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+                 if ((*vprot ^ *vprot_ptr) & mask) break;
+             return (curr_idx - start_idx) << page_shift;
+         }
++        curr_idx += sizeof(UINT_PTR);
++        vprot_ptr += sizeof(UINT_PTR);
+     }
+     return size;
+ }
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index 7a9a4901547420a5015708d88f898312ccad1511..543a96bf85dbcb21174980853152112aa8c278fe 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -3340,6 +3340,7 @@ BOOL WINAPI WinHttpReceiveResponse( HINTERNET hrequest, LPVOID reserved )
+ {
+     DWORD ret;
+     struct request *request;
++    WCHAR defer[2];
+ 
+     TRACE("%p, %p\n", hrequest, reserved);
+ 
+@@ -3355,7 +3356,26 @@ BOOL WINAPI WinHttpReceiveResponse( HINTERNET hrequest, LPVOID reserved )
+         return FALSE;
+     }
+ 
+-    ret = receive_response( request );
++    /* The title pumps messages under the same connection lock as its HTTP
++     * worker. In an asynchronous session, don't keep that caller inside
++     * read_reply() until the remote headers arrive. Use the request's
++     * existing FIFO (including its handle retention and status callbacks).
++     * Other applications keep the usual inline notification behavior. */
++    if ((request->connect->hdr.flags & WINHTTP_FLAG_ASYNC) &&
++        GetEnvironmentVariableW( L"FROSTY_ASYNC_HTTP_HEADERS", defer, ARRAY_SIZE(defer) ) == 1 && defer[0] == '1')
++    {
++        LONG state = InterlockedCompareExchange( (LONG *)&request->state, REQUEST_STATE_READ_RESPONSE_QUEUED,
++                                                 REQUEST_STATE_REQUEST_SENT );
++        if (state == REQUEST_STATE_REQUEST_SENT)
++        {
++            if ((ret = queue_receive_response( request )))
++                InterlockedCompareExchange( (LONG *)&request->state, REQUEST_STATE_REQUEST_SENT,
++                                            REQUEST_STATE_READ_RESPONSE_QUEUED );
++        }
++        else if (state == REQUEST_STATE_READ_RESPONSE_QUEUED) ret = ERROR_WINHTTP_INCORRECT_HANDLE_STATE;
++        else ret = receive_response( request );
++    }
++    else ret = receive_response( request );
+ 
+     release_object( &request->hdr );
+     SetLastError( ret );

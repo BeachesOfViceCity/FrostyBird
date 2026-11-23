@@ -1,0 +1,43 @@
+Package 1.20.1831.3754, Wine, local vkd3d-proton, RX 6950 XT / RADV
+
+Run 96: FOcclusionRGS Global[3754], collection 7fb4b432781382ea,
+was among all 96 supplied shadow permutations. Compared with run 95,
+only r.RayTracing.ForceAllRayTracingEffects=0 disappeared from the CVar log.
+Resource creation then failed in FD3D12Adapter::CreatePlacedResource:
+offset 0x200000 did not meet the default 0x400000 MSAA alignment.
+
+Run 98: identical CVar entries to run 96. The XS bridge used 64 KiB MSAA
+placement for sizing and creation. Trace: placed 4x MSAA, 2304x1296,
+offset 0x3c10000, alignment 0x10000. At the shipping raygen search:
+  requested SHA-1 25022ab0b6f35658da664ed24474657d7e44dee6
+  return index (r9d) 0x14, count (r10) 0x63.
+See build/street-shadow-lookup-98/launch.log.
+
+Run 99: the XS list received DispatchRays(2304,960,1), raygen 64 bytes,
+miss table 192 bytes / stride 96, hit table 71232 bytes / stride 96.
+The first unresolved pipeline dependency in that run was 822eb8ee00e2a684,
+Frosty[31715]. That run did not execute the pending native ray dispatch.
+
+Run 100: build/street-shadow-tables-100/ray-tables.tsv captures the SBT
+upload; instances-ffff8001dd020000.tsv is the fenced instance readback
+for the TLAS actually bound in space1 t10. All 341 rows have FORCE_OPAQUE.
+The columns are row, instance mask, SBT contribution, flags, BLAS VA,
+and known geometry count (zero means unresolved).
+
+Independent geometry test: build/street-shadow-full-check/radv.log
+  Whole retail shadow raygen: 70/70 RGBA texels matched
+  (20 outside viewport; 3 occluded, 12 clear inside)
+  Retail intersection raygen + miss + hit group: 8/8
+  Triangle position fetch: 72/72; inline walker: 80/80
+The checked visibility image uses the complete five-part Global[3754]
+program; it is not a screenshot from ChaseSection-CityIntro.
+
+Run 101: the main RenderViewFamily_RenderThread path submitted the original
+shadow raygen. The native pipeline linked 17 source exports; six 2304x960x1
+dispatches retired, including the per-ray specialization status readback.
+build/street-shadow-native-101/street-window-1247.png is the WakeUp interior
+after WU_VID_0010 closed. The 3840x2160 FTonemapPS output at present
+counter 1246 matched all 8,294,400 RGB scanout pixels on present 1247;
+all 893,440 visible X11 pixels matched that same held GPU scanout.
+Evidence: tonemap-vs-scanout.json, wakeup-window-measurement.json,
+street-window-1247.timeline, .window, launch.log and gpu-work.tsv.

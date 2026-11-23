@@ -1,0 +1,38 @@
+Retail Xbox HWRT, Linux / Wine / RX 6950 XT / RADV
+
+build/gameplay-hwrt-80/launch.log
+frosty/dxr: recorded BLAS count=1 flags=0x6 destination=0xffff80010d000000 scratch=0xffff8001018b0000
+frosty/dxr: recorded BLAS count=1 flags=0x6 destination=0xffff80010d014900 scratch=0xffff8001018d0000
+frosty/dxr: recorded BLAS count=1 flags=0x6 destination=0xffff80010d01c100 scratch=0xffff8001018f0000
+frosty/dxr: native collection d7d2885201fab17d DXIL 4976 bytes hr=0
+frosty/dxr: collection d7d2885201fab17d requires Xbox state-object property selector 0
+
+gpu-work.tsv: submission 1, presented 0, direct queue, build-blas, 1 geometry, flags 6
+queue-01-type-0.tsv: final observer fence 157/157 retired
+SPTR capture sha256 e2dfc27ed0f4469ceab36a4ac3fe4b680b1bff1957b6e2aae60556f52725ba05
+
+build/hwrt-retail-check/collections.log
+BLAS: result 7872 bytes, scratch 70816
+TLAS: result 704 bytes, scratch 65908
+ray 0: instance 17 primitive 1 t 110.0000 uv 0.52000 0.26000 OK
+ray 1: instance 41 primitive 1 t 190.0000 uv 0.52000 0.26000 OK
+XS DXR tier 11: 54 vertices, 48 triangles, 2 instances, 8/8 rays matched
+Retail OcclusionMainRG_d7cd43b4 + DefaultPayloadMS_1b832205: 8/8 occlusion results matched
+
+build/hwrt-lumen-check/radv.log
+Retail OcclusionMainRG_d7cd43b4 + LumenHardwareRayTracingMaterialMS_3b1ba881: 8/8 occlusion results matched
+
+build/street-pool-88/passes.tsv (frame 14)
+RenderViewFamily_RenderThread -> FD3D12RayTracingScene::BuildAccelerationStructure: 265 instances
+Previous scene capture: 0 instances, UpdateSceneCaptureContentDeferred_RenderThread
+
+build/street-inline-view-89/gpu-indirect.tsv (frame 13, first GPU records)
+2f04235f8a89f48e  FLumenDirectLightingHardwareRayTracingBatchedCS  8,448,1
+ee13094ffeae114f  FLumenRadianceCacheHardwareRayTracingCS          64,119,1
+04463d316fa9e14d  FLumenScreenProbeGatherHardwareRayTracingCS     2,1,1
+c4a03341c11dd1b8  FLumenReflectionHardwareRayTracingCS            11,1,1
+
+build/street-walker-check/radv.log
+KHR hardware triangle position fetch: 72/72 coordinates matched
+Lumen inline walker helpers: 80/80 hit, distance, instance, mask, range and budget fields matched
+Retail IntersectionMainRG_d7cd43b4 + DefaultPayloadMS_1b832205 + HitGroup_0f71980a_eb1ce8e7: 8/8 intersection results matched

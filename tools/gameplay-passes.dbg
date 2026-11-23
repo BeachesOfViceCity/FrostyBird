@@ -1,0 +1,14 @@
+info symbol opus_decode
+break *((unsigned long long)&opus_decode + 0x3a3a330)
+cont
+bt
+disable 1
+break *((unsigned long long)&opus_decode + 0x3901e10)
+cont
+bt
+disable 2
+break *((unsigned long long)&opus_decode + 0x38ab620)
+cont
+bt
+disable 3
+cont

@@ -1,0 +1,1098 @@
+diff --git a/libs/vkd3d/acceleration_structure.c b/libs/vkd3d/acceleration_structure.c
+index 7f7ed1a51838b11a559e82e89300d3c957d56ab4..b5b495400f02b30ceb80ed31ce7e215e375bfd7d 100644
+--- a/libs/vkd3d/acceleration_structure.c
++++ b/libs/vkd3d/acceleration_structure.c
+@@ -282,6 +282,11 @@ bool vkd3d_acceleration_structure_convert_inputs(struct d3d12_device *device,
+     }
+ 
+     build_info->flags = d3d12_build_flags_to_vk(desc->Flags);
++    /* Opt-in flag for the XS interop caller. Apply the identical flag to
++     * size queries, builds and updates. Regular D3D12 BLASes pay no cost. */
++    if (desc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL &&
++            ((uint32_t)desc->Flags & 0x80000000u) && device->device_info.ray_tracing_position_fetch_features.rayTracingPositionFetch)
++        build_info->flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_DATA_ACCESS_BIT_KHR;
+ 
+     if (desc->Flags & D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE)
+     {
+@@ -856,4 +861,3 @@ end_unlock:
+ end:
+     return va;
+ }
+-
+diff --git a/libs/vkd3d/command.c b/libs/vkd3d/command.c
+index b19418881e2d5081b1b6543a515d1fad2f7483f1..62322de37f6d799c27edcf654749f11c0134b28c 100644
+--- a/libs/vkd3d/command.c
++++ b/libs/vkd3d/command.c
+@@ -2515,13 +2515,15 @@ static HRESULT d3d12_command_allocator_reset_command_pool(
+         return S_OK;
+ 
+     /* Just keep reusing the command buffers without allocate/free pairs. */
+-    vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
++    if (!vkd3d_array_reserve((void **)&pool->recycled.command_buffers, &pool->recycled.command_buffers_size,
+             pool->recycled.command_buffer_count + pool->pending.command_buffer_count,
+-            sizeof(*pool->recycled.command_buffers));
++            sizeof(*pool->recycled.command_buffers)))
++        return E_OUTOFMEMORY;
+ 
+-    memcpy(pool->recycled.command_buffers + pool->recycled.command_buffer_count,
+-            pool->pending.command_buffers,
+-            pool->pending.command_buffer_count * sizeof(*pool->pending.command_buffers));
++    if (pool->pending.command_buffer_count)
++        memcpy(pool->recycled.command_buffers + pool->recycled.command_buffer_count,
++                pool->pending.command_buffers,
++                pool->pending.command_buffer_count * sizeof(*pool->pending.command_buffers));
+ 
+     pool->recycled.command_buffer_count += pool->pending.command_buffer_count;
+     pool->pending.command_buffer_count = 0;
+@@ -2762,6 +2764,137 @@ static void d3d12_command_allocator_free_command_pool(
+     VK_CALL(vkDestroyCommandPool(device->vk_device, pool->vk_command_pool, NULL));
+ }
+ 
++static void *d3d12_command_pool_reset_worker(void *arg)
++{
++    struct d3d12_device *device = arg;
++    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
++    struct d3d12_command_allocator_command_pool *pool;
++    unsigned int i, n;
++    HRESULT hr;
++
++    vkd3d_set_thread_name("vkd3d_poolreset");
++    pthread_mutex_lock(&r->lock);
++    for (;;)
++    {
++        for (n = 0; n < ARRAY_SIZE(r->slots); ++n)
++        {
++            i = (r->cursor + n) % ARRAY_SIZE(r->slots);
++            if (r->slots[i].state == POOL_QUEUED)
++                break;
++        }
++        if (n == ARRAY_SIZE(r->slots))
++        {
++            if (r->stop) break;
++            pthread_cond_wait(&r->wake, &r->lock);
++            continue;
++        }
++        r->cursor = (i + 1) % ARRAY_SIZE(r->slots);
++        r->slots[i].state = POOL_RESETTING;
++        pool = &r->slots[i].pool;
++        pthread_mutex_unlock(&r->lock);
++        hr = d3d12_command_allocator_reset_command_pool(device, pool);
++        if (FAILED(hr))
++        {
++            d3d12_command_allocator_free_command_pool(pool, device);
++            if (hr == DXGI_ERROR_DEVICE_REMOVED)
++                d3d12_device_mark_as_removed(device, hr, "Command pool reset failed.\n");
++        }
++        pthread_mutex_lock(&r->lock);
++        r->slots[i].state = SUCCEEDED(hr) ? POOL_READY : POOL_EMPTY;
++    }
++    pthread_mutex_unlock(&r->lock);
++    return NULL;
++}
++
++void d3d12_command_pool_resetter_init(struct d3d12_device *device)
++{
++    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
++    char value[8];
++    if (!vkd3d_get_env_var("FROSTY_ASYNC_POOL_RESET", value, sizeof(value)) || strcmp(value, "1"))
++        return;
++    r->report = vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
++    if (pthread_mutex_init(&r->lock, NULL)) return;
++    if (!pthread_cond_init(&r->wake, NULL))
++    {
++        if (!pthread_create(&r->thread, NULL, d3d12_command_pool_reset_worker, device))
++        {
++            r->enabled = true;
++            return;
++        }
++        pthread_cond_destroy(&r->wake);
++    }
++    pthread_mutex_destroy(&r->lock);
++}
++
++void d3d12_command_pool_resetter_cleanup(struct d3d12_device *device)
++{
++    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
++    unsigned int i;
++    if (!r->enabled) return;
++    pthread_mutex_lock(&r->lock);
++    r->stop = true;
++    pthread_cond_signal(&r->wake);
++    pthread_mutex_unlock(&r->lock);
++    pthread_join(r->thread, NULL);
++    for (i = 0; i < ARRAY_SIZE(r->slots); ++i)
++        if (r->slots[i].state == POOL_READY)
++            d3d12_command_allocator_free_command_pool(&r->slots[i].pool, device);
++    pthread_cond_destroy(&r->wake);
++    pthread_mutex_destroy(&r->lock);
++}
++
++/* Close returned the old command buffers to pending, and Reset has checked
++ * recording state and outstanding submissions. Transfer both handle arrays
++ * with their pool. An independent clean pool is ready for the caller. */
++static bool d3d12_command_allocator_exchange_pool(struct d3d12_device *device,
++        struct d3d12_command_allocator_command_pool *pool)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    struct d3d12_command_pool_resetter *r = &device->pool_resetter;
++    struct d3d12_command_allocator_command_pool fresh = {0};
++    unsigned int i, empty = ARRAY_SIZE(r->slots);
++    VkCommandPoolCreateInfo info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
++    if (!r->enabled || !pool->pending.command_buffer_count)
++        return false;
++    pthread_mutex_lock(&r->lock);
++    for (i = 0; i < ARRAY_SIZE(r->slots); ++i)
++    {
++        if (r->slots[i].state == POOL_READY && r->slots[i].pool.vk_family_index == pool->vk_family_index &&
++                r->slots[i].pool.vk_queue_flags == pool->vk_queue_flags)
++        {
++            fresh = r->slots[i].pool;
++            break;
++        }
++        if (r->slots[i].state == POOL_EMPTY)
++            empty = i;
++    }
++    if (i == ARRAY_SIZE(r->slots))
++    {
++        if (empty == ARRAY_SIZE(r->slots))
++        {
++            pthread_mutex_unlock(&r->lock);
++            return false;
++        }
++        i = empty;
++        info.queueFamilyIndex = fresh.vk_family_index = pool->vk_family_index;
++        fresh.vk_queue_flags = pool->vk_queue_flags;
++        if (VK_CALL(vkCreateCommandPool(device->vk_device, &info, NULL, &fresh.vk_command_pool)) != VK_SUCCESS)
++        {
++            pthread_mutex_unlock(&r->lock);
++            return false;
++        }
++        ++r->fresh;
++    }
++    r->slots[i].state = POOL_QUEUED;
++    r->slots[i].pool = *pool;
++    *pool = fresh;
++    if (r->report && !(r->exchanges++ % 8192))
++        INFO("Frosty retired command pools: %"PRIu64" exchanges, %"PRIu64" fresh.\n", r->exchanges, r->fresh);
++    pthread_cond_signal(&r->wake);
++    pthread_mutex_unlock(&r->lock);
++    return true;
++}
++
+ static ULONG d3d12_command_allocator_dec_ref(struct d3d12_command_allocator *allocator)
+ {
+     unsigned int i, j;
+@@ -2970,7 +3103,8 @@ static HRESULT STDMETHODCALLTYPE d3d12_command_allocator_Reset(ID3D12CommandAllo
+             VKD3D_QUEUE_TIMELINE_TRACE_STATE_TYPE_COMMAND_ALLOCATOR_RESET,
+             allocator->primary_pool.pending.command_buffer_count);
+ 
+-    if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->primary_pool)))
++    if ((allocator->current_command_list || !d3d12_command_allocator_exchange_pool(device, &allocator->primary_pool)) &&
++            FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->primary_pool)))
+         return hr;
+     if (FAILED(hr = d3d12_command_allocator_reset_command_pool(device, &allocator->fallback_pool)))
+         return hr;
+diff --git a/libs/vkd3d/device.c b/libs/vkd3d/device.c
+index 3139d6dd495305c0c84d5ca59ee7a93fb4c55c56..4cd60ea4bddf8522f61ad002f5902be1332067c3 100644
+--- a/libs/vkd3d/device.c
++++ b/libs/vkd3d/device.c
+@@ -72,6 +72,7 @@ static const struct vkd3d_optional_extension_info optional_device_extensions[] =
+     VK_EXTENSION_DISABLE_COND(KHR_ACCELERATION_STRUCTURE, KHR_acceleration_structure, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION_DISABLE_COND(KHR_DEFERRED_HOST_OPERATIONS, KHR_deferred_host_operations, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION_DISABLE_COND(KHR_RAY_QUERY, KHR_ray_query, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
++    VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_POSITION_FETCH, KHR_ray_tracing_position_fetch, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION_DISABLE_COND(KHR_RAY_TRACING_MAINTENANCE_1, KHR_ray_tracing_maintenance1, VKD3D_CONFIG_FLAG_STATIC(NO_DXR)),
+     VK_EXTENSION(KHR_FRAGMENT_SHADING_RATE, KHR_fragment_shading_rate),
+     VK_EXTENSION(KHR_FRAGMENT_SHADER_BARYCENTRIC, KHR_fragment_shader_barycentric),
+@@ -1387,6 +1388,11 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
+         info->ray_tracing_maintenance1_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+         vk_prepend_struct(&info->features2, &info->ray_tracing_maintenance1_features);
+     }
++    if (vulkan_info->KHR_ray_tracing_position_fetch)
++    {
++        info->ray_tracing_position_fetch_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
++        vk_prepend_struct(&info->features2, &info->ray_tracing_position_fetch_features);
++    }
+ 
+     if (vulkan_info->KHR_fragment_shading_rate)
+     {
+@@ -3896,6 +3902,8 @@ static void d3d12_device_destroy(struct d3d12_device *device)
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     size_t i, j;
+ 
++    d3d12_command_pool_resetter_cleanup(device);
++    vkd3d_buffer_supply_cleanup(device);
+     d3d_destruction_notifier_free(&device->destruction_notifier);
+ 
+     if (device->internal_sparse_queue)
+@@ -10738,6 +10746,8 @@ static HRESULT d3d12_device_init(struct d3d12_device *device,
+     d3d12_device_reserve_internal_sparse_queue(device);
+     d3d_destruction_notifier_init(&device->destruction_notifier, (IUnknown*)&device->ID3D12Device_iface);
+     d3d12_device_open_kmt(device);
++    d3d12_command_pool_resetter_init(device);
++    vkd3d_buffer_supply_init(device);
+     return S_OK;
+ 
+ out_cleanup_descriptor_qa_global_info:
+diff --git a/libs/vkd3d/device_vkd3d_ext.c b/libs/vkd3d/device_vkd3d_ext.c
+index 694c4e1e570c2fe7818a2045fadbe8626744df95..2aa37b0b1bb30f49a5568758b36495aba30e2cbf 100644
+--- a/libs/vkd3d/device_vkd3d_ext.c
++++ b/libs/vkd3d/device_vkd3d_ext.c
+@@ -737,6 +737,13 @@ static BOOL STDMETHODCALLTYPE d3d12_device_vkd3d_ext_IsNvShaderExtnOpCodeSupport
+ 
+     switch (op_code)
+     {
++        case 0x46534749u: /* XS group-ordinal protocol, independent of physical vendor */
++            return !!(device->device_info.vulkan_1_1_properties.subgroupSupportedStages & VK_SHADER_STAGE_COMPUTE_BIT);
++        case NV_EXTN_OP_RT_TRIANGLE_OBJECT_POSITIONS:
++        case NV_EXTN_OP_RT_CANDIDATE_TRIANGLE_OBJECT_POSITIONS:
++        case NV_EXTN_OP_RT_COMMITTED_TRIANGLE_OBJECT_POSITIONS:
++            return device->device_info.ray_tracing_position_fetch_features.rayTracingPositionFetch ? TRUE : FALSE;
++
+         case NV_EXTN_OP_RT_SPHERE_OBJECT_POSITION_AND_RADIUS:
+         case NV_EXTN_OP_RT_CANDIDATE_SPHERE_OBJECT_POSITION_AND_RADIUS:
+         case NV_EXTN_OP_RT_COMMITTED_SPHERE_OBJECT_POSITION_AND_RADIUS:
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 453007388af18c14f8f7a9a5c276b5e64d3a9c35..417b4a00ab7960f6b29e681e388732b66536be15 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1966,9 +1966,12 @@ static void vkd3d_memory_allocator_remove_chunk(struct vkd3d_memory_allocator *a
+ 
+ HRESULT vkd3d_memory_allocator_init(struct vkd3d_memory_allocator *allocator, struct d3d12_device *device)
+ {
++    char value[8];
+     int rc;
+ 
+     memset(allocator, 0, sizeof(*allocator));
++    allocator->keep_empty_buffers = vkd3d_get_env_var("FROSTY_KEEP_BUFFER_CHUNKS", value, sizeof(value)) && !strcmp(value, "1");
++    allocator->report_empty_buffers = allocator->keep_empty_buffers && vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
+ 
+     if ((rc = pthread_mutex_init(&allocator->mutex, NULL)))
+         return hresult_from_errno(rc);
+@@ -2085,7 +2088,16 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
+             continue;
+ 
+         if (SUCCEEDED(hr = vkd3d_memory_chunk_allocate_range(chunk, memory_requirements, allocation)))
++        {
++            if (chunk->warm_idle)
++            {
++                chunk->warm_idle = false;
++                allocator->idle_buffer_bytes -= chunk->allocation.resource.size;
++                if (allocator->report_empty_buffers && !(allocator->reused_empty_buffers++ % 128))
++                    INFO("Frosty empty buffer chunks: %"PRIu64" reuses.\n", allocator->reused_empty_buffers);
++            }
+             return hr;
++        }
+     }
+ 
+     /* Try allocating a new chunk on one of the supported memory type
+@@ -2113,7 +2125,20 @@ void vkd3d_free_memory(struct d3d12_device *device, struct vkd3d_memory_allocato
+         vkd3d_memory_chunk_free_range(allocation->chunk, allocation);
+ 
+         if (vkd3d_memory_chunk_is_free(allocation->chunk))
+-            vkd3d_memory_allocator_remove_chunk(allocator, device, allocation->chunk);
++        {
++            struct vkd3d_memory_chunk *chunk = allocation->chunk;
++            /* Normal suballocation clears still run, including on the first
++             * new borrower. Only retain the backing and its registered VA. */
++            if (allocator->keep_empty_buffers && chunk->allocation.heap_type == D3D12_HEAP_TYPE_DEFAULT &&
++                    (chunk->allocation.flags & VKD3D_ALLOCATION_FLAG_GPU_ADDRESS) &&
++                    chunk->allocation.resource.size <= (64ull << 20) - allocator->idle_buffer_bytes)
++            {
++                chunk->warm_idle = true;
++                allocator->idle_buffer_bytes += chunk->allocation.resource.size;
++            }
++            else
++                vkd3d_memory_allocator_remove_chunk(allocator, device, chunk);
++        }
+         pthread_mutex_unlock(&allocator->mutex);
+     }
+     else
+@@ -2247,6 +2272,7 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
+     bool implementation_can_zero_clear_alloc;
+     bool needs_command_clear;
+     bool suballocate;
++    bool tried_trim = false;
+     HRESULT hr;
+ 
+     suballocate = vkd3d_memory_info_allow_suballocate(device, info);
+@@ -2275,11 +2301,29 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
+         info = &tmp_info;
+     }
+ 
++retry:
+     if (suballocate)
+         hr = vkd3d_suballocate_memory(device, allocator, info, allocation);
+     else
+         hr = vkd3d_memory_allocation_init(allocation, device, allocator, info);
+ 
++    if (hr == E_OUTOFMEMORY && allocator->keep_empty_buffers && !tried_trim)
++    {
++        size_t i;
++        bool evicted = false;
++        tried_trim = true;
++        pthread_mutex_lock(&allocator->mutex);
++        for (i = allocator->chunks_count; i--;)
++        {
++            struct vkd3d_memory_chunk *chunk = allocator->chunks[i];
++            if (!chunk->warm_idle) continue;
++            allocator->idle_buffer_bytes -= chunk->allocation.resource.size;
++            vkd3d_memory_allocator_remove_chunk(allocator, device, chunk);
++            evicted = true;
++        }
++        pthread_mutex_unlock(&allocator->mutex);
++        if (evicted) goto retry;
++    }
+     if (FAILED(hr))
+         return hr;
+ 
+@@ -2302,6 +2346,131 @@ HRESULT vkd3d_allocate_memory(struct d3d12_device *device, struct vkd3d_memory_a
+     return hr;
+ }
+ 
++static void *vkd3d_buffer_supply_worker(void *arg)
++{
++    struct d3d12_device *device = arg;
++    struct vkd3d_buffer_supply *s = &device->buffer_supply;
++    struct vkd3d_memory_allocation allocation;
++    unsigned int n, i;
++    HRESULT hr;
++    vkd3d_set_thread_name("vkd3d_bufsupply");
++    pthread_mutex_lock(&s->lock);
++    while (!s->stop)
++    {
++        for (n = 0; n < ARRAY_SIZE(s->bins); ++n)
++        {
++            i = (s->cursor + n) % ARRAY_SIZE(s->bins);
++            if (s->bins[i].seen >= 2 && !s->bins[i].failed && s->bins[i].count < ARRAY_SIZE(s->bins[i].slots) &&
++                    s->bins[i].info.heap_desc.SizeInBytes <= (48ull << 20) - s->bytes)
++                break;
++        }
++        if (n == ARRAY_SIZE(s->bins))
++        {
++            pthread_cond_wait(&s->wake, &s->lock);
++            continue;
++        }
++        s->cursor = (i + 1) % ARRAY_SIZE(s->bins);
++        s->bytes += s->bins[i].info.heap_desc.SizeInBytes;
++        pthread_mutex_unlock(&s->lock);
++        hr = vkd3d_allocate_heap_memory(device, &device->memory_allocator, &s->bins[i].info, &allocation);
++        if (SUCCEEDED(hr) && !allocation.chunk)
++        {
++            /* Dedicated allocation VA maps point at the allocation record. */
++            vkd3d_free_memory(device, &device->memory_allocator, &allocation);
++            hr = E_FAIL;
++        }
++        pthread_mutex_lock(&s->lock);
++        if (FAILED(hr))
++        {
++            s->bins[i].failed = true;
++            s->bytes -= s->bins[i].info.heap_desc.SizeInBytes;
++        }
++        else
++            s->bins[i].slots[s->bins[i].count++] = allocation;
++    }
++    pthread_mutex_unlock(&s->lock);
++    return NULL;
++}
++
++void vkd3d_buffer_supply_init(struct d3d12_device *device)
++{
++    struct vkd3d_buffer_supply *s = &device->buffer_supply;
++    char value[8];
++    if (!vkd3d_get_env_var("FROSTY_BUFFER_SUPPLY", value, sizeof(value)) || strcmp(value, "1")) return;
++    s->report = vkd3d_get_env_var("FROSTY_POOL_STATS", value, sizeof(value)) && !strcmp(value, "1");
++    if (pthread_mutex_init(&s->lock, NULL)) return;
++    if (!pthread_cond_init(&s->wake, NULL))
++    {
++        if (!pthread_create(&s->thread, NULL, vkd3d_buffer_supply_worker, device))
++        {
++            s->enabled = true;
++            return;
++        }
++        pthread_cond_destroy(&s->wake);
++    }
++    pthread_mutex_destroy(&s->lock);
++}
++
++void vkd3d_buffer_supply_cleanup(struct d3d12_device *device)
++{
++    struct vkd3d_buffer_supply *s = &device->buffer_supply;
++    unsigned int i;
++    if (!s->enabled) return;
++    pthread_mutex_lock(&s->lock);
++    s->stop = true;
++    pthread_cond_signal(&s->wake);
++    pthread_mutex_unlock(&s->lock);
++    pthread_join(s->thread, NULL);
++    for (i = 0; i < ARRAY_SIZE(s->bins); ++i)
++        while (s->bins[i].count)
++            vkd3d_free_memory(device, &device->memory_allocator, &s->bins[i].slots[--s->bins[i].count]);
++    pthread_cond_destroy(&s->wake);
++    pthread_mutex_destroy(&s->lock);
++}
++
++HRESULT vkd3d_allocate_committed_buffer_backing(struct d3d12_device *device,
++        const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation)
++{
++    struct vkd3d_buffer_supply *s = &device->buffer_supply;
++    VkDeviceSize size = info->heap_desc.SizeInBytes;
++    unsigned int i;
++    HRESULT hr;
++    if (!s->enabled || info->host_ptr || info->extra_allocation_flags || info->explicit_global_buffer_usage ||
++            info->heap_desc.Properties.Type != D3D12_HEAP_TYPE_DEFAULT ||
++            info->heap_desc.Flags != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS ||
++            info->heap_desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT ||
++            size < (256u << 10) || size >= VKD3D_VA_BLOCK_SIZE || size % D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
++        return vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
++    i = size / D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
++    if (i >= ARRAY_SIZE(s->bins))
++        return vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
++
++    pthread_mutex_lock(&s->lock);
++    if (s->bins[i].count && !memcmp(&s->bins[i].info, info, sizeof(*info)))
++    {
++        *allocation = s->bins[i].slots[--s->bins[i].count];
++        s->bytes -= size;
++        if (s->report && !(s->hits++ % 512))
++            INFO("Frosty prepared buffer backing: %"PRIu64" hits, %"PRIu64" misses, %"PRIu64" reserved bytes.\n",
++                    s->hits, s->misses, s->bytes);
++        pthread_cond_signal(&s->wake);
++        pthread_mutex_unlock(&s->lock);
++        return S_OK;
++    }
++    pthread_mutex_unlock(&s->lock);
++    hr = vkd3d_allocate_heap_memory(device, &device->memory_allocator, info, allocation);
++    if (SUCCEEDED(hr) && allocation->chunk)
++    {
++        pthread_mutex_lock(&s->lock);
++        ++s->misses;
++        if (!s->bins[i].seen) s->bins[i].info = *info;
++        if (!memcmp(&s->bins[i].info, info, sizeof(*info)) && s->bins[i].seen < 2 && ++s->bins[i].seen == 2)
++            pthread_cond_signal(&s->wake);
++        pthread_mutex_unlock(&s->lock);
++    }
++    return hr;
++}
++
+ static bool vkd3d_heap_allocation_accept_deferred_resource_placements(struct d3d12_device *device,
+         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags)
+ {
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b6fdbf67af8ba2cc4862b989fb34550735..430da1efd62c4075f76dcc896449fa0789d50171 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -4587,8 +4587,7 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
+             allocate_info.heap_desc.Flags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+         }
+ 
+-        if (FAILED(hr = vkd3d_allocate_heap_memory(device,
+-                &device->memory_allocator, &allocate_info, &object->mem)))
++        if (FAILED(hr = vkd3d_allocate_committed_buffer_backing(device, &allocate_info, &object->mem)))
+             goto fail;
+ 
+         object->res.vk_buffer = object->mem.resource.vk_buffer;
+diff --git a/libs/vkd3d/state.c b/libs/vkd3d/state.c
+index b640fb76e6b0b0ba7a38c5bfeb11a058486be256..038cd77f8d2bf88eab4b0ac838dc076755ce8f61 100644
+--- a/libs/vkd3d/state.c
++++ b/libs/vkd3d/state.c
+@@ -24,6 +24,7 @@
+ #include "vkd3d_rw_spinlock.h"
+ #include "vkd3d_timestamp_profiler.h"
+ #include <stdio.h>
++#include "frosty_stage_cache.h"
+ 
+ /* ID3D12RootSignature */
+ static HRESULT STDMETHODCALLTYPE d3d12_root_signature_QueryInterface(ID3D12RootSignature *iface,
+@@ -77,6 +78,7 @@ static void d3d12_root_signature_cleanup(struct d3d12_root_signature *root_signa
+ {
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+ 
++    frosty_stage_forget_root(root_signature);
+     vkd3d_sampler_state_free_descriptor_set(&device->sampler_state, device,
+             root_signature->vk_sampler_set, root_signature->vk_sampler_pool);
+ 
+@@ -3321,11 +3323,52 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
+                 device->descriptor_qa_global_info, dxbc.code, dxbc.size);
+         d3d12_pipeline_state_init_compile_arguments(state, device, stage, &compile_args);
+ 
+-        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
+-                0, &shader_interface, &compile_args)) < 0)
+         {
+-            WARN("Failed to compile shader, vkd3d result %d.\n", ret);
+-            return hresult_from_vkd3d_result(ret);
++            struct frosty_stage_key cache_key;
++            bool cacheable = frosty_stage_key_init(&cache_key, state, &dxbc, &shader_interface,
++                    &compile_args, spirv_code_debug != NULL);
++            bool hit = cacheable && frosty_stage_get(&cache_key, state->root_signature, &dxbc,
++                    spirv_code, spirv_code_debug);
++            uint64_t start = frosty_flag("FROSTY_STAGE_TIMES") ? vkd3d_get_current_time_ns() : 0;
++            bool disk_hit = false;
++#ifdef _WIN32
++            struct frosty_disk_id disk;
++            bool use_disk = cacheable && !hit && frosty_disk_key(&disk, &cache_key, state->root_signature, &dxbc);
++            disk_hit = use_disk && frosty_disk_get(&disk, spirv_code, spirv_code_debug);
++            if (disk_hit) frosty_stage_put(&cache_key, state->root_signature, &dxbc, spirv_code, spirv_code_debug);
++#endif
++            if ((hit || disk_hit) && frosty_flag("FROSTY_VERIFY_STAGES"))
++            {
++                struct vkd3d_shader_code verify = {0};
++                struct vkd3d_shader_code_debug dbg = {0};
++                bool match = vkd3d_shader_compile_dxbc(&dxbc, &verify, spirv_code_debug ? &dbg : NULL,
++                        0, &shader_interface, &compile_args) >= 0 && verify.size == spirv_code->size &&
++                        !memcmp(&verify.meta, &spirv_code->meta, sizeof(verify.meta)) &&
++                        !memcmp(verify.code, spirv_code->code, verify.size) &&
++                        (!spirv_code_debug || !strcmp(dbg.debug_entry_point_name ? dbg.debug_entry_point_name : "",
++                        spirv_code_debug->debug_entry_point_name ? spirv_code_debug->debug_entry_point_name : ""));
++                INFO("Frosty stage replay byte comparison: %s.\n", match ? "matched" : "MISMATCH");
++                vkd3d_shader_free_shader_code(&verify);
++                vkd3d_shader_free_shader_code_debug(&dbg);
++                if (!match) return E_FAIL;
++            }
++            if (!hit && !disk_hit)
++            {
++                if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
++                        0, &shader_interface, &compile_args)) < 0)
++                {
++                    WARN("Failed to compile shader, vkd3d result %d.\n", ret);
++                    return hresult_from_vkd3d_result(ret);
++                }
++                if (cacheable)
++                    frosty_stage_put(&cache_key, state->root_signature, &dxbc, spirv_code, spirv_code_debug);
++#ifdef _WIN32
++                if (use_disk) frosty_disk_put(&disk, spirv_code, spirv_code_debug);
++#endif
++            }
++            if (start)
++                INFO("Frosty stage %x %s (%s), %.3f ms, %zu SPIR-V bytes.\n", stage, disk_hit ? "disk" : hit ? "hit" : "compiled",
++                        cacheable ? "cacheable" : "direct", (vkd3d_get_current_time_ns() - start) * 1e-6, spirv_code->size);
+         }
+         TRACE("Called vkd3d_shader_compile_dxbc.\n");
+ 
+@@ -6766,6 +6809,104 @@ static VkResult d3d12_pipeline_state_link_pipeline_variant(struct d3d12_pipeline
+     return vr;
+ }
+ 
++/* Keep an exact vertex program reusable across newly streamed fragment
++ * programs, and conversely. The source stage infos carry the original
++ * specialization constants, subgroup size, entry point and root layout. */
++static VkResult d3d12_frosty_graphics_pipeline(struct d3d12_device *device, VkPipelineCache cache,
++        const VkGraphicsPipelineCreateInfo *full, const VkPipelineRenderingCreateInfo *rendering,
++        VkPipelineCreateFlags2 flags, bool allow_split, VkPipeline *pipeline)
++{
++    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
++    VkPipeline libs[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
++    VkPipelineRenderingCreateInfo formats;
++    VkGraphicsPipelineLibraryCreateInfoEXT group;
++    VkPipelineCreateFlags2CreateInfo f;
++    VkGraphicsPipelineCreateInfo ci;
++    VkPipelineLibraryCreateInfoKHR link;
++    unsigned int frag, i;
++    static LONG reported;
++    char env[8];
++    VkResult vr;
++
++    if (!allow_split || full->stageCount != 2 ||
++            !device->device_info.graphics_pipeline_library_features.graphicsPipelineLibrary ||
++            !device->device_info.graphics_pipeline_library_properties.graphicsPipelineLibraryFastLinking ||
++            !vkd3d_get_env_var("FROSTY_FAST_GPL", env, sizeof(env)) || strcmp(env, "1"))
++        goto ordinary;
++    frag = full->pStages[0].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? 0 : 1;
++    if (full->pStages[frag].stage != VK_SHADER_STAGE_FRAGMENT_BIT ||
++            full->pStages[1 - frag].stage != VK_SHADER_STAGE_VERTEX_BIT)
++        goto ordinary;
++
++    /* Prefer an already optimized monolithic pipeline. Do not block for
++     * that optimization before trying a driver-supported fast link. */
++    if (device->device_info.vulkan_1_3_features.pipelineCreationCacheControl)
++    {
++        f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
++            .pNext = rendering, .flags = flags | VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT};
++        ci = *full;
++        ci.pNext = &f;
++        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, pipeline));
++        if (vr != VK_PIPELINE_COMPILE_REQUIRED)
++            return vr;
++    }
++    for (i = 0; i < ARRAY_SIZE(libs); ++i)
++    {
++        formats = *rendering;
++        group = (VkGraphicsPipelineLibraryCreateInfoEXT){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
++            .pNext = &formats, .flags = i ? VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT |
++            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT : VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT |
++            VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT};
++        f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
++            .pNext = &group, .flags = flags | VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR};
++        ci = *full;
++        ci.pNext = &f;
++        ci.stageCount = 1;
++        ci.pStages = &full->pStages[i ? frag : 1 - frag];
++        if (!i)
++        {
++            /* Only viewMask belongs to pre-rasterization state. */
++            formats.colorAttachmentCount = 0;
++            formats.pColorAttachmentFormats = NULL;
++            formats.depthAttachmentFormat = formats.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
++            ci.pColorBlendState = NULL;
++            ci.pDepthStencilState = NULL;
++            ci.pMultisampleState = NULL;
++        }
++        else
++        {
++            ci.pVertexInputState = NULL;
++            ci.pInputAssemblyState = NULL;
++            ci.pViewportState = NULL;
++            ci.pRasterizationState = NULL;
++        }
++        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, &libs[i]));
++        if (vr != VK_SUCCESS)
++            goto release;
++    }
++    link = (VkPipelineLibraryCreateInfoKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR,
++        .libraryCount = ARRAY_SIZE(libs), .pLibraries = libs};
++    f = (VkPipelineCreateFlags2CreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO,
++        .pNext = &link, .flags = flags};
++    ci = (VkGraphicsPipelineCreateInfo){.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++        .pNext = &f, .layout = full->layout, .basePipelineIndex = -1};
++    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, &ci, NULL, pipeline));
++release:
++    for (i = 0; i < ARRAY_SIZE(libs); ++i)
++        if (libs[i])
++            VK_CALL(vkDestroyPipeline(device->vk_device, libs[i], NULL));
++    if (vr == VK_SUCCESS)
++    {
++        if (!InterlockedCompareExchange(&reported, 1, 0))
++            INFO("Fast-linked separate vertex and fragment pipelines.\n");
++        return vr;
++    }
++    if (vr == VK_PIPELINE_COMPILE_REQUIRED)
++        return vr;
++ordinary:
++    return VK_CALL(vkCreateGraphicsPipelines(device->vk_device, cache, 1, full, NULL, pipeline));
++}
++
+ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_state *state,
+         const struct vkd3d_pipeline_key *key, const struct vkd3d_format *dsv_format, VkPipelineCache vk_cache,
+         VkGraphicsPipelineLibraryFlagsEXT library_flags, uint32_t *dynamic_state_flags)
+@@ -6958,7 +7099,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+     if (flags2.flags)
+         vk_prepend_struct(&pipeline_desc, &flags2);
+ 
+-    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
++    vr = d3d12_frosty_graphics_pipeline(device, vk_cache, &pipeline_desc, &fragment_output_desc.rt_info,
++            flags2.flags, !key && !library_flags && !graphics->library && !graphics->multiview.dynamic_mask &&
++            !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG), &vk_pipeline);
+ 
+     if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+     {
+@@ -7008,7 +7151,9 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
+         pipeline_desc.pStages = state->graphics.stages;
+ 
+         cookie = vkd3d_queue_timeline_trace_register_pso_compile(&device->queue_timeline_trace);
+-        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
++        vr = d3d12_frosty_graphics_pipeline(device, vk_cache, &pipeline_desc, &fragment_output_desc.rt_info,
++                flags2.flags, !key && !library_flags && !graphics->library && !graphics->multiview.dynamic_mask &&
++                !VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_LOG), &vk_pipeline);
+ 
+         if (vkd3d_queue_timeline_trace_cookie_is_valid(cookie))
+         {
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index e63dc7b7dc5d91df8e4bf01e34222347c53d4a06..908922bbf65bc8d70373bdff23caa5a3522730d9 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -134,6 +134,7 @@ struct vkd3d_vulkan_info
+     bool KHR_ray_query;
+     bool KHR_fragment_shading_rate;
+     bool KHR_ray_tracing_maintenance1;
++    bool KHR_ray_tracing_position_fetch;
+     bool KHR_fragment_shader_barycentric;
+     bool KHR_external_memory_win32;
+     bool KHR_external_semaphore_win32;
+@@ -911,9 +912,34 @@ struct vkd3d_memory_free_range
+     VkDeviceSize length;
+ };
+ 
++/* Exact, not-yet-issued slices of regular committed DEFAULT buffer backing.
++ * The resource and its requested width, state and flags are created on
++ * demand. Only slices whose VA map belongs to a stable chunk may move. */
++struct vkd3d_buffer_supply
++{
++    pthread_mutex_t lock;
++    pthread_cond_t wake;
++    pthread_t thread;
++    bool enabled, stop, report;
++    unsigned int cursor;
++    uint64_t bytes, hits, misses;
++    struct
++    {
++        struct vkd3d_allocate_heap_memory_info info;
++        struct vkd3d_memory_allocation slots[2];
++        unsigned int seen, count;
++        bool failed;
++    } bins[32];
++};
++void vkd3d_buffer_supply_init(struct d3d12_device *device);
++void vkd3d_buffer_supply_cleanup(struct d3d12_device *device);
++HRESULT vkd3d_allocate_committed_buffer_backing(struct d3d12_device *device,
++        const struct vkd3d_allocate_heap_memory_info *info, struct vkd3d_memory_allocation *allocation);
++
+ struct vkd3d_memory_chunk
+ {
+     struct vkd3d_memory_allocation allocation;
++    bool warm_idle;
+     struct vkd3d_memory_free_range *free_ranges;
+     size_t free_ranges_size;
+     size_t free_ranges_count;
+@@ -992,6 +1018,8 @@ bool vkd3d_memory_transfer_queue_clear_in_flight(struct vkd3d_memory_transfer_qu
+ struct vkd3d_memory_allocator
+ {
+     pthread_mutex_t mutex;
++    bool keep_empty_buffers, report_empty_buffers;
++    uint64_t idle_buffer_bytes, reused_empty_buffers;
+ 
+     struct vkd3d_memory_chunk **chunks;
+     size_t chunks_size;
+@@ -2762,6 +2790,23 @@ struct d3d12_command_allocator_command_pool
+     struct d3d12_command_allocator_command_pool_list recycled, pending;
+ };
+ 
++struct d3d12_command_pool_resetter
++{
++    pthread_mutex_t lock;
++    pthread_cond_t wake;
++    pthread_t thread;
++    bool enabled, stop, report;
++    unsigned int cursor;
++    uint64_t exchanges, fresh;
++    struct
++    {
++        enum { POOL_EMPTY, POOL_QUEUED, POOL_RESETTING, POOL_READY } state;
++        struct d3d12_command_allocator_command_pool pool;
++    } slots[8];
++};
++void d3d12_command_pool_resetter_init(struct d3d12_device *device);
++void d3d12_command_pool_resetter_cleanup(struct d3d12_device *device);
++
+ struct vkd3d_descriptor_heap_meta_allocation
+ {
+     struct d3d12_descriptor_heap *heap;
+@@ -5400,6 +5445,7 @@ struct vkd3d_physical_device_info
+     VkPhysicalDeviceFragmentShadingRateFeaturesKHR fragment_shading_rate_features;
+     VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric_features_khr;
+     VkPhysicalDeviceRayQueryFeaturesKHR ray_query_features;
++    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR ray_tracing_position_fetch_features;
+     VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features_khr;
+     VkPhysicalDeviceShaderImageAtomicInt64FeaturesEXT shader_image_atomic_int64_features;
+     VkPhysicalDeviceImageViewMinLodFeaturesEXT image_view_min_lod_features;
+@@ -5915,6 +5961,7 @@ struct d3d12_device
+ 
+     struct vkd3d_memory_transfer_queue memory_transfers;
+     struct vkd3d_memory_allocator memory_allocator;
++    struct vkd3d_buffer_supply buffer_supply;
+     struct vkd3d_null_rtas_allocation null_rtas_allocation;
+ 
+     struct vkd3d_queue *internal_sparse_queue;
+@@ -5927,6 +5974,7 @@ struct d3d12_device
+     size_t query_pool_count;
+ 
+     struct vkd3d_cached_command_allocator cached_command_allocators[VKD3D_CACHED_COMMAND_ALLOCATOR_COUNT];
++    struct d3d12_command_pool_resetter pool_resetter;
+     size_t cached_command_allocator_count;
+ 
+     uint32_t *descriptor_heap_gpu_vas;
+diff --git a/libs/vkd3d/frosty_stage_cache.h b/libs/vkd3d/frosty_stage_cache.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..26306f1661b7d1e933120e7d0a8e1b0e69a7c9f0
+--- /dev/null
++++ b/libs/vkd3d/frosty_stage_cache.h
+@@ -0,0 +1,290 @@
++/* An opt-in bounded cache for DXIL -> SPIR-V on streamed VS/PS pairs.
++ * The Vulkan pipeline itself still uses the complete render state. */
++struct frosty_stage_key
++{
++    struct d3d12_device *device;
++    uint64_t root_hash, source_hash;
++    struct vkd3d_shader_interface_info iface;
++    struct vkd3d_shader_compile_arguments args;
++    struct vkd3d_shader_parameter params[3];
++    unsigned int swizzles[8];
++    struct vkd3d_shader_descriptor_binding ubo, offset;
++    bool debug;
++};
++
++struct frosty_stage_entry
++{
++    struct frosty_stage_key key;
++    const struct d3d12_root_signature *owner;
++    struct vkd3d_shader_code spirv;
++    char *name;
++    void *source;
++    size_t len;
++    uint64_t age;
++};
++
++static struct frosty_stage_entry frosty_stages[512];
++static size_t frosty_stage_bytes;
++static uint64_t frosty_stage_age;
++static pthread_mutex_t frosty_stage_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static bool frosty_flag(const char *name)
++{
++    char value[8];
++    return vkd3d_get_env_var(name, value, sizeof(value)) && !strcmp(value, "1");
++}
++
++static bool frosty_stage_key_init(struct frosty_stage_key *k, struct d3d12_pipeline_state *state,
++        const struct vkd3d_shader_code *source, const struct vkd3d_shader_interface_info *i,
++        const struct vkd3d_shader_compile_arguments *a, bool debug)
++{
++    char tmp[256];
++    if (state->pipeline_type != VKD3D_PIPELINE_TYPE_GRAPHICS ||
++            (i->stage != VK_SHADER_STAGE_VERTEX_BIT && i->stage != VK_SHADER_STAGE_FRAGMENT_BIT) ||
++            !frosty_flag("FROSTY_SPIRV_STAGES") ||
++            source->size > (16u << 20) || a->parameter_count > ARRAY_SIZE(k->params) ||
++            a->output_swizzle_count > ARRAY_SIZE(k->swizzles) || i->stage_input_map || i->stage_output_map ||
++            i->xfb_info || i->root_signature_blob || i->root_parameter_mappings ||
++            VKD3D_CONFIG_FLAG_IS_SET(PIPELINE_LIBRARY_SANITIZE_SPIRV) ||
++            VKD3D_CONFIG_FLAG_IS_SET(EXTENDED_DEBUG_UTILS) ||
++            vkd3d_get_env_var("VKD3D_SHADER_OVERRIDE", tmp, sizeof(tmp)) ||
++            vkd3d_get_env_var("VKD3D_SHADER_DUMP_PATH", tmp, sizeof(tmp)))
++        return false;
++    memset(k, 0, sizeof(*k));
++    k->device = state->device;
++    k->root_hash = state->root_signature->pso_compatibility_hash;
++    k->source_hash = vkd3d_shader_hash(source);
++    k->debug = debug;
++    k->iface = *i;
++    k->args = *a;
++    /* The two immutable root arrays are compared by bytes on a hit. The
++     * originating root removes its entries before freeing either array. */
++    k->iface.bindings = NULL;
++    k->iface.push_constant_buffers = NULL;
++    if (i->push_constant_ubo_binding) k->ubo = *i->push_constant_ubo_binding;
++    if (i->offset_buffer_binding) k->offset = *i->offset_buffer_binding;
++    k->iface.push_constant_ubo_binding = NULL;
++    k->iface.offset_buffer_binding = NULL;
++    if (a->parameter_count) memcpy(k->params, a->parameters, a->parameter_count * sizeof(*a->parameters));
++    if (a->output_swizzle_count) memcpy(k->swizzles, a->output_swizzles, a->output_swizzle_count * sizeof(*a->output_swizzles));
++    k->args.parameters = NULL;
++    k->args.output_swizzles = NULL;
++    /* Extension list and quirk info are immutable for this device.
++     * Descriptor-QA pointers, if present in this build, still have to match. */
++    return true;
++}
++
++static void frosty_stage_remove(struct frosty_stage_entry *e)
++{
++    frosty_stage_bytes -= e->len + e->spirv.size;
++    vkd3d_free(e->source);
++    vkd3d_free((void *)e->spirv.code);
++    vkd3d_free(e->name);
++    memset(e, 0, sizeof(*e));
++}
++
++static void frosty_stage_forget_root(const struct d3d12_root_signature *root)
++{
++    unsigned int i;
++    pthread_mutex_lock(&frosty_stage_lock);
++    for (i = 0; i < ARRAY_SIZE(frosty_stages); ++i)
++        if (frosty_stages[i].owner == root)
++            frosty_stage_remove(&frosty_stages[i]);
++    pthread_mutex_unlock(&frosty_stage_lock);
++}
++
++static struct frosty_stage_entry *frosty_stage_find(const struct frosty_stage_key *k,
++        const struct d3d12_root_signature *root, const struct vkd3d_shader_code *s)
++{
++    struct frosty_stage_entry *e;
++    unsigned int i;
++    for (i = 0; i < ARRAY_SIZE(frosty_stages); ++i)
++    {
++        e = &frosty_stages[i];
++        if (!e->owner || e->len != s->size || e->key.source_hash != k->source_hash ||
++                memcmp(&e->key, k, sizeof(*k)) || memcmp(e->source, s->code, s->size))
++            continue;
++        if (e->owner != root && ((k->iface.binding_count && memcmp(e->owner->bindings, root->bindings,
++                k->iface.binding_count * sizeof(*root->bindings))) ||
++                (k->iface.push_constant_buffer_count && memcmp(e->owner->root_constants, root->root_constants,
++                k->iface.push_constant_buffer_count * sizeof(*root->root_constants)))))
++            continue;
++        return e;
++    }
++    return NULL;
++}
++
++#ifdef _WIN32
++#include <wincrypt.h>
++struct frosty_disk_id {WCHAR path[1200]; BYTE key[32];};
++struct frosty_disk_header {uint32_t version, size, name; struct vkd3d_shader_meta meta; BYTE key[32], seal[32];};
++static HCRYPTPROV frosty_hash_provider;
++static pthread_once_t frosty_hash_once = PTHREAD_ONCE_INIT;
++static void frosty_init_hash(void)
++{
++    CryptAcquireContextW(&frosty_hash_provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT);
++}
++static bool frosty_hash_new(HCRYPTHASH *h)
++{
++    pthread_once(&frosty_hash_once, frosty_init_hash);
++    return frosty_hash_provider && CryptCreateHash(frosty_hash_provider, CALG_SHA_256, 0, 0, h);
++}
++static bool frosty_digest(HCRYPTHASH h, BYTE *dst)
++{
++    DWORD n = 32;
++    return CryptGetHashParam(h, HP_HASHVAL, dst, &n, 0) && n == 32;
++}
++static bool frosty_disk_key(struct frosty_disk_id *id, const struct frosty_stage_key *k,
++        const struct d3d12_root_signature *root, const struct vkd3d_shader_code *src)
++{
++    const struct d3d12_device *dev = k->device;
++    struct frosty_stage_key stable = *k;
++    static const WCHAR hex[] = L"0123456789abcdef";
++    DWORD i, n = GetEnvironmentVariableW(L"FROSTY_SPIRV_DIR", id->path, 1100);
++    HCRYPTHASH h;
++    bool good;
++    if (!n || n >= 1100 || !frosty_hash_new(&h)) return false;
++    stable.device = NULL; stable.args.target_extensions = NULL; stable.args.quirks = NULL;
++#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
++    if (stable.iface.descriptor_qa_payload_binding || stable.iface.descriptor_qa_control_binding)
++    { CryptDestroyHash(h); return false; }
++#endif
++#define FROSTY_HASH(p, n) ((n) == 0 || CryptHashData(h, (const BYTE *)(p), (DWORD)(n), 0))
++    good = FROSTY_HASH(&stable, sizeof(stable)) &&
++           FROSTY_HASH(&dev->shader_interface_key, sizeof(dev->shader_interface_key)) &&
++           FROSTY_HASH(dev->device_info.properties2.properties.pipelineCacheUUID, VK_UUID_SIZE) &&
++           FROSTY_HASH(k->args.target_extensions, k->args.target_extension_count * sizeof(*k->args.target_extensions)) &&
++           FROSTY_HASH(root->bindings, k->iface.binding_count * sizeof(*root->bindings)) &&
++           FROSTY_HASH(root->root_constants, k->iface.push_constant_buffer_count * sizeof(*root->root_constants)) &&
++           FROSTY_HASH(src->code, src->size) && frosty_digest(h, id->key);
++    CryptDestroyHash(h);
++    if (!good) return false;
++    id->path[n++] = '\\';
++    for (i = 0; i < 32; ++i) {id->path[n++] = hex[id->key[i] >> 4];id->path[n++] = hex[id->key[i] & 15];}
++    wcscpy(id->path+n, L".spvpack");
++    return true;
++}
++static bool frosty_disk_seal(const struct frosty_disk_header *hdr, const void *data, const char *name, BYTE out[32])
++{
++    HCRYPTHASH h; bool ok;
++    if (!frosty_hash_new(&h)) return false;
++    ok = FROSTY_HASH(hdr, offsetof(struct frosty_disk_header, seal)) && FROSTY_HASH(data, hdr->size) &&
++            FROSTY_HASH(name, hdr->name) && frosty_digest(h, out);
++    CryptDestroyHash(h); return ok;
++}
++#undef FROSTY_HASH
++static bool frosty_disk_get(const struct frosty_disk_id *id, struct vkd3d_shader_code *out, struct vkd3d_shader_code_debug *debug)
++{
++    struct frosty_disk_header hdr;
++    LARGE_INTEGER size; BYTE seal[32]; DWORD n;
++    void *data = NULL; char *name = NULL; bool success = false;
++    HANDLE f = CreateFileW(id->path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
++    if (f == INVALID_HANDLE_VALUE) return false;
++    if (!ReadFile(f, &hdr, sizeof(hdr), &n, NULL) || n != sizeof(hdr) || hdr.version != 1 ||
++            memcmp(hdr.key, id->key, 32) || hdr.size < 20 || hdr.size % 4 || hdr.size > (32u << 20) ||
++            hdr.name > 4096 || (hdr.name && !debug) || !GetFileSizeEx(f, &size) ||
++            size.QuadPart != (int64_t)(sizeof(hdr) + hdr.size + hdr.name)) goto done;
++    if (!(data = vkd3d_malloc(hdr.size)) || !ReadFile(f, data, hdr.size, &n, NULL) || n != hdr.size ||
++            *(const uint32_t *)data != 0x07230203) goto done;
++    if (hdr.name && (!(name = vkd3d_malloc(hdr.name)) || !ReadFile(f, name, hdr.name, &n, NULL) ||
++            n != hdr.name || name[n-1])) goto done;
++    if (!frosty_disk_seal(&hdr, data, name, seal) || memcmp(seal, hdr.seal, 32)) goto done;
++    out->code = data; out->size = hdr.size; out->meta = hdr.meta; if (debug) debug->debug_entry_point_name = name;
++    success = true; data = NULL; name = NULL;
++done:
++    CloseHandle(f);vkd3d_free(data);vkd3d_free(name);return success;
++}
++static void frosty_disk_put(const struct frosty_disk_id *id, const struct vkd3d_shader_code *out, const struct vkd3d_shader_code_debug *debug)
++{
++    const char *name = debug ? debug->debug_entry_point_name : NULL;
++    size_t namesize = name ? strlen(name)+1 : 0;
++    struct frosty_disk_header hdr = {0};
++    WCHAR tmp[1270];HANDLE f;DWORD n;bool ok;
++    if (!out->size || out->size > (32u << 20) || namesize > 4096) return;
++    hdr.version=1; hdr.size=(uint32_t)out->size; hdr.name=(uint32_t)namesize; hdr.meta=out->meta;memcpy(hdr.key,id->key,32);
++    if (!frosty_disk_seal(&hdr,out->code,name,hdr.seal))return;
++    swprintf(tmp,ARRAY_SIZE(tmp),L"%ls.%lu.%lu.tmp",id->path,(unsigned long)GetCurrentProcessId(),(unsigned long)GetCurrentThreadId());
++    f=CreateFileW(tmp,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
++    if(f==INVALID_HANDLE_VALUE)return;
++    ok=WriteFile(f,&hdr,sizeof(hdr),&n,NULL) && n==sizeof(hdr) && WriteFile(f,out->code,hdr.size,&n,NULL) && n==hdr.size &&
++        (!hdr.name || (WriteFile(f,name,hdr.name,&n,NULL) && n==hdr.name));CloseHandle(f);
++    if(!ok || !MoveFileExW(tmp,id->path,MOVEFILE_REPLACE_EXISTING))DeleteFileW(tmp);
++}
++#endif
++
++static bool frosty_stage_get(const struct frosty_stage_key *k, const struct d3d12_root_signature *root,
++        const struct vkd3d_shader_code *source, struct vkd3d_shader_code *out, struct vkd3d_shader_code_debug *debug)
++{
++    struct frosty_stage_entry *e;
++    void *data = NULL;
++    pthread_mutex_lock(&frosty_stage_lock);
++    if ((e = frosty_stage_find(k, root, source)) && (data = vkd3d_malloc(e->spirv.size)))
++    {
++        if (debug && e->name && !(debug->debug_entry_point_name = vkd3d_strdup(e->name)))
++        {
++            vkd3d_free(data);
++            data = NULL;
++        }
++        else
++        {
++            memcpy(data, e->spirv.code, e->spirv.size);
++            *out = e->spirv;
++            out->code = data;
++            e->age = ++frosty_stage_age;
++        }
++    }
++    pthread_mutex_unlock(&frosty_stage_lock);
++    return data != NULL;
++}
++
++static void frosty_stage_put(const struct frosty_stage_key *k, const struct d3d12_root_signature *root,
++        const struct vkd3d_shader_code *source, const struct vkd3d_shader_code *out,
++        const struct vkd3d_shader_code_debug *debug)
++{
++    struct frosty_stage_entry *free_slot, *oldest;
++    const size_t limit = 128u << 20;
++    void *input, *spv;
++    char *name = NULL;
++    unsigned int i;
++    if (!out->size || out->size > (32u << 20) || !(input = vkd3d_malloc(source->size)))
++        return;
++    if (!(spv = vkd3d_malloc(out->size)) ||
++            (debug && debug->debug_entry_point_name && !(name = vkd3d_strdup(debug->debug_entry_point_name))))
++        goto done;
++    memcpy(input, source->code, source->size);
++    memcpy(spv, out->code, out->size);
++    pthread_mutex_lock(&frosty_stage_lock);
++    if (frosty_stage_find(k, root, source))
++        goto unlock;
++    for (;;)
++    {
++        free_slot = NULL;
++        oldest = NULL;
++        for (i = 0; i < ARRAY_SIZE(frosty_stages); ++i)
++        {
++            struct frosty_stage_entry *e = &frosty_stages[i];
++            if (!e->owner) free_slot = e;
++            else if (!oldest || e->age < oldest->age) oldest = e;
++        }
++        if (free_slot && frosty_stage_bytes + source->size + out->size <= limit)
++            break;
++        if (!oldest) goto unlock;
++        frosty_stage_remove(oldest);
++    }
++    free_slot->key = *k;
++    free_slot->owner = root;
++    free_slot->len = source->size;
++    free_slot->source = input;
++    free_slot->spirv = *out;
++    free_slot->spirv.code = spv;
++    free_slot->name = name;
++    free_slot->age = ++frosty_stage_age;
++    frosty_stage_bytes += source->size + out->size;
++    input = NULL; spv = NULL; name = NULL;
++unlock:
++    pthread_mutex_unlock(&frosty_stage_lock);
++done:
++    vkd3d_free(input);
++    vkd3d_free(spv);
++    vkd3d_free(name);
++}

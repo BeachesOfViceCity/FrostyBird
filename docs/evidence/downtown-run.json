@@ -1,0 +1,45 @@
+{
+  "run": "street-downtown-107",
+  "present": 3360,
+  "section": "CityIntro",
+  "open_media_sessions": [],
+  "window_class": "UnrealWindowGDK",
+  "window_size": [
+    1280,
+    698
+  ],
+  "scanout_size": [
+    3840,
+    2160
+  ],
+  "window_exact_rgb_pixels": 893440,
+  "visible_window_pixels": 893440,
+  "desktop_exact_scaled_pixels": 314640,
+  "desktop_scaled_pixels": 314640,
+  "source_sha256": {
+    "build/street-downtown-107/street-window-3360.png": "cfd64cf78b992d991cdbad4c97136929e54b7b9cfcee10b62a597a739839da5c",
+    "build/street-downtown-107/frame-003360.ppm": "bef0ebdb3e5060d33d4aa8744646fcd158890b536915fd37facf7bb5247ac6e2",
+    "/home/comrade/Documents/2026-11-21_11-55.png": "439a2758de5820cfdc8217dc5a53fe89281033f7ced9856a805204098be60682"
+  },
+  "gameplay_profile_sha256": "2f8121733f9b07e1e4754a99793935d69afe7ab30626905a00043b065bf62ef5",
+  "immediately_preceding_counter_samples": [
+    {
+      "pass": "DXR / TLAS build",
+      "presented": 3359,
+      "submission": 1142,
+      "command": "build-tlas",
+      "shaders": [],
+      "types": [],
+      "arguments": [
+        101341,
+        4,
+        0
+      ]
+    }
+  ],
+  "render_work": "build/street-reference-107/frame-003360/render-work.json",
+  "comparison": {
+    "foreground_crosswalk_stripes": "not visible in this present",
+    "left_hand_facades": "less detailed than the supplied reference"
+  }
+}

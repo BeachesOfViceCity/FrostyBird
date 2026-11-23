@@ -1,0 +1,140 @@
+{
+  "run": "street-desktop-108",
+  "shipping": {
+    "frame": 3311,
+    "section": "CityIntro",
+    "window_size": [
+      1280,
+      698
+    ],
+    "client_size": [
+      1284,
+      698
+    ],
+    "scanout_size": [
+      3840,
+      2160
+    ],
+    "win32_class": "UnrealWindowGDK",
+    "hwnd": "0000000000020056",
+    "open_media_sessions": [],
+    "window_metadata": [
+      "XID=12582913",
+      "t=342.610",
+      "WM_CLASS(STRING) = \"frosty-xsx-shipping.exe\", \"frosty-xsx-shipping.exe\"",
+      "_NET_WM_NAME(UTF8_STRING) = \"Frosty  \"",
+      "_NET_WM_PID(CARDINAL) = 371936"
+    ],
+    "rgb_mean_abs_error": 0.0,
+    "exact_rgb_pixels": 893440,
+    "visible_pixels": 893440,
+    "rgb_pixels_exact_fraction": 1.0,
+    "same_present_tonemap_samples": [],
+    "source_sha256": {
+      "/home/comrade/OtherShit/GTA6/XBoxGame/build/street-desktop-108/street-window-3311.png": "1786b854fd08ea029343b827624ccb644a4f4bbd364f028f6ac775a745ce9579",
+      "/home/comrade/OtherShit/GTA6/XBoxGame/build/street-desktop-108/frame-003311.ppm": "cb96aafc615dc60b60d3da7c1bce7c85001e5e7f4e2727335c6c4376466a9c55",
+      "/home/comrade/Documents/2026-11-21_11-55.png": "439a2758de5820cfdc8217dc5a53fe89281033f7ced9856a805204098be60682"
+    }
+  },
+  "desktop": {
+    "frame": 3311,
+    "section": "CityIntro",
+    "shipping_pid": 371936,
+    "desktop_display": ":0",
+    "desktop_xid": "138412034",
+    "desktop_properties": [
+      "WM_CLASS(STRING) = \"gamescope\", \"gamescope\"",
+      "_NET_WM_NAME(UTF8_STRING) = \"Frosty  \"",
+      "_NET_WM_PID(CARDINAL) = 371884"
+    ],
+    "desktop_window_size": [
+      3828,
+      2080
+    ],
+    "shipping_window_size": [
+      1280,
+      698
+    ],
+    "shipping_content_bounds": [
+      0,
+      91,
+      1280,
+      608
+    ],
+    "desktop_content_bounds": [
+      64,
+      294,
+      3751,
+      1785
+    ],
+    "equal_content_dimensions": false,
+    "exact_content_pixels": null,
+    "thumbnail_rgb_mae_0_255": 0.9092566287878788,
+    "thumbnail_rgb_correlation": 0.9995270826278522
+  },
+  "sampled_render_work": {
+    "frame": 3311,
+    "section": "CityIntro",
+    "first_verified_city_present": 3304,
+    "sampled_work_counter_range": [
+      3303,
+      3310
+    ],
+    "sample_counts_by_command": {
+      "dispatch": 18,
+      "indirect-indexed": 34,
+      "indexed": 153,
+      "build-tlas": 7,
+      "indirect-dispatch": 4
+    },
+    "sampled_at_immediately_preceding_counter": [
+      {
+        "pass": "DXR / TLAS build",
+        "presented": 3310,
+        "submission": 1084,
+        "command": "build-tlas",
+        "shaders": [],
+        "types": [],
+        "arguments": [
+          101532,
+          4,
+          0
+        ]
+      }
+    ],
+    "latest_sample_by_pass": {
+      "Nanite / material": {
+        "presented": 3309,
+        "submission": 1081,
+        "command": "indexed",
+        "shaders": [
+          "a9fffc66bc93a964",
+          "e795b3ac82d0eef1"
+        ],
+        "types": [
+          "FNaniteMultiViewMaterialVS"
+        ],
+        "arguments": [
+          3,
+          4,
+          9
+        ]
+      },
+      "DXR / TLAS build": {
+        "presented": 3310,
+        "submission": 1084,
+        "command": "build-tlas",
+        "shaders": [],
+        "types": [],
+        "arguments": [
+          101532,
+          4,
+          0
+        ]
+      }
+    },
+    "nonzero_fenced_indirect_by_pass": {}
+  },
+  "hold_file": "build/street-desktop-108/window-pair-3311.hold",
+  "profile_sha256": "2f8121733f9b07e1e4754a99793935d69afe7ab30626905a00043b065bf62ef5"
+}

@@ -1,0 +1,30 @@
+Package 1.20.1831.3754, local vkd3d-proton, RX 6950 XT / RADV.
+
+The two headless shipping launches used disposable copies of player state
+and the same gameplay settings. Both reached a movie-free CityIntro shot.
+The supervisor stopped each private Wine session after the verified present.
+
+  build/shader-cache-title-1: present 3175, 4525 host requests, 2541 unique
+    3474 packet hits, 1051 translator runs, 1039 by-source hits, 12 DXC compiles.
+  Offline replay of its exact manifest: 2541 / 2541 packet hits.
+  build/shader-cache-title-2: present 3215, 4489 host requests, 2513 unique
+    4487 packet hits, 2 translator runs, 2 DXC compiles.
+    5fc80f5e61ac4751: previously seen source, different bound view vector.
+    9c5ccc1aa2ab96d9: previously unseen base pixel shader.
+  Summaries: build/shader-cache-proof/shipping-launches.json and exact-replay.json.
+
+Separate ClearCS Wine launches started with an empty host cache: 2 DXC
+compilations on cold start; 2 packet hits, 0 translator runs, 0 DXC
+compilations on warm start. Both returned 336/336 expected GPU words.
+The warm vkd3d run created both compute pipelines from module identifiers
+without a compile-required fallback. Native pipeline creation still occurs.
+  build/shader-cache-proof/gpu/final.json and final-warm.log
+
+Real RT source: 7fb4b432781382ea.xsrt, 39607 bytes, SHA-256
+0a3c177eac844948127e8a296b8acea32d3c92ef9add6b6d4d20c634b39fc173.
+The captured binding/payload contract produced the checked 149932-byte
+raygen library and all 14 binding IDs. A fresh cache instance returned the
+same packet with no translation. The two shipping captures have 411 XSRT
+originals in common; all 411 pairs share their respective source inode.
+Source retention is independent of the count of compiled ray exports.
+  build/shader-cache-proof/primary-ray-library.json and shared-xsrt.json

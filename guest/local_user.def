@@ -1,0 +1,8 @@
+LIBRARY xgameruntime
+EXPORTS
+    InitializeApiImpl=frosty_grt_core.InitializeApiImpl
+    InitializeApiImplEx=frosty_grt_core.InitializeApiImplEx
+    InitializeApiImplEx2=frosty_grt_core.InitializeApiImplEx2
+    QueryApiImpl
+    UninitializeApiImpl=frosty_grt_core.UninitializeApiImpl
+    XErrorReport=frosty_grt_core.XErrorReport

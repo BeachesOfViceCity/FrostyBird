@@ -1,0 +1,7 @@
+info symbol opus_decode
+hbreak *((unsigned long long)&opus_decode + 0x23edde4)
+cont
+info regs
+x/1b $rdi+0x1e7
+bt
+cont

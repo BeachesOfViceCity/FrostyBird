@@ -1,0 +1,41 @@
+Evidence directory: build/enter-verified-53
+Package: 1.20.1831.3754
+Controller: real GameInput readings via frosty-pad.exe
+
+run: /home/comrade/Downloads/the-matrix-awakens-an-unreal-engine-5-experience-1.20.1831.3754/436609B6.46723EFB36115_1.20.1831.3754_neutral__9ncxwbgmmv7m8_xs/Mount/Frosty/Binaries/XSX/Frosty-XSX-Shipping.exe
+Wine: /home/comrade/OtherShit/GTA6/XBoxGame/build/wine64/wine | prefix: /home/comrade/OtherShit/GTA6/XBoxGame/build/codec-test-prefix
+
+[2026.11.21-18.49.07:183][  0]LogGDKSaveGame: Container 'FrostySaveData' not found
+[2026.11.21-18.49.08:385][  0]LogFrosty: AFrostyGameState::SetCurrentGameStateType - PreviousGameState: EFrostyGameStateType::None  New Game State: EFrostyGameStateType::Startflow
+[2026.11.21-18.49.56:393][490]LogElectraPlayer: [000000379CEEF250][0000003697572490] Playback reached end at play position 21.022
+[2026.11.21-18.51.30:350][819]LogFrosty: AFrostyGameState::RequestStateChangeToChase - Attempting to enter Chase state
+[2026.11.21-18.51.34:653][917]LogFrosty: AFrostyGameState::SetCurrentGameStateType - PreviousGameState: EFrostyGameStateType::Startflow  New Game State: EFrostyGameStateType::Chase
+
+WineDbg excerpt (tools/enter-screen.dbg):
+Stopped on breakpoint 1 at 0x007ff6ef5e9e74 frosty-xsx-shipping+0x24d9e74
+Register dump:
+ rip:00007ff6ef5e9e74 rsp:000000367c02e710 rbp:000000367c02e900 eflags:00010206 (  R- --  I   - -P- )
+ rax:00007ff6f37f9108 rbx:000000367c02eaa0 rcx:00000037510d0430 rdx:0000000000000000
+ rsi:00000037755368c0 rdi:00000037755368c0  r8:0000000000000000  r9:0000000000000000 r10:0000003794698fa0
+ r11:000000006918c5a8 r12:000000367c02e980 r13:00000037755368c0 r14:000000367c02eaa0 r15:000000369c7c67c0
+ 01
+Backtrace:
+=>0 0x007ff6ef5e9e74 in frosty-xsx-shipping (+0x24d9e74) (0x0000367c02e900)
+  1 0x007ff6ef6959be in frosty-xsx-shipping (+0x25859be) (0x0000367c02e900)
+  2 0x007ff6efb02cfd in frosty-xsx-shipping (+0x29f2cfd) (0x0000367c02e900)
+
+Title-window property dump:
+XID=12582913
+t=93.347
+WM_CLASS(STRING) = "frosty-xsx-shipping.exe", "frosty-xsx-shipping.exe"
+_NET_WM_NAME(UTF8_STRING) = "Frosty  "
+_NET_WM_PID(CARDINAL) = 160917
+
+GPU readback: frame-001536.ppm, 3840 x 2160, RGB
+PNG decoded RGB SHA-256: a92ba32dfe3c962666e993088eaf17ddf89e690cdbebfbf19f30d961c9d11e53
+
+Capture file SHA-256:
+e15864792d2e9bb09ea752829653241a76e53d2569cd892885ee8c8faa017fab  build/enter-verified-53/frame-001536.ppm
+fbfbda2875e6021077c9d0a3d881125742735d969d8b45a2823f8979884db5e4  docs/evidence/enter-4k.png
+1ab91058f4d443d2b44feec3b31f7801ac44b82694376a0e81c06964b303c495  docs/evidence/enter-window.png
+1968432299fd2b354848b5278c737621bafb43243c6ab9d38597f8c2e97f423c  docs/evidence/enter-window.mp4

@@ -1,0 +1,27 @@
+diff --git a/opcodes/dxil/dxil_nvapi.cpp b/opcodes/dxil/dxil_nvapi.cpp
+index c57619ecedbd20e27792d6c98f8a25f394eb31f1..c3ba903cef6032c3b68e53f3288e8a2f7444df31 100644
+--- a/opcodes/dxil/dxil_nvapi.cpp
++++ b/opcodes/dxil/dxil_nvapi.cpp
+@@ -504,6 +504,22 @@ static bool emit_nvapi_extn_op_get_special(Converter::Impl &impl)
+ 
+ 		switch (subopcode)
+ 		{
++		case 0x46534749u: // Explicit XS bridge query: subgroup ordinal in this compute workgroup.
++		{
++			uint32_t w = impl.execution_mode_meta.wave_size_min;
++			// SM 6.6 stores a fixed wave size in min alone; SM 6.8 can
++			// encode the same requirement as a singleton range.
++			if (impl.execution_model != spv::ExecutionModelGLCompute || (w != 32 && w != 64) ||
++			    (impl.execution_mode_meta.wave_size_max && impl.execution_mode_meta.wave_size_max != w) ||
++			    impl.execution_mode_meta.workgroup_threads[0] % w)
++				return false;
++			auto id = impl.spirv_module.get_builtin_shader_input(spv::BuiltInSubgroupId);
++			auto *load = impl.allocate(spv::OpLoad, builder.makeUintType(32));
++			load->add_id(id);
++			impl.add(load);
++			impl.nvapi.fake_doorbell_outputs[0] = load->id;
++			return true;
++		}
+ 		case NV_SPECIALOP_GLOBAL_TIMER_LO:
+ 		case NV_SPECIALOP_GLOBAL_TIMER_HI:
+ 		{

@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 1 },
+  "configurePresets": [
+    {
+      "name": "runtime",
+      "displayName": "Complete x86-64 Linux / Xbox runtime",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "FROSTY_SUPERBUILD": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "runtime", "configurePreset": "runtime", "targets": ["frosty-runtime"], "jobs": 2 }
+  ]
+}

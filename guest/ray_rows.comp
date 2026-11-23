@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+// The two words of a D3D12 instance row needed by checked SBT linkage.
+// The transform, ID, BLAS address and precise mask value stay in the TLAS.
+layout(buffer_reference,std430,buffer_reference_align=4) readonly buffer Source { uint word[]; };
+layout(buffer_reference,std430,buffer_reference_align=4) writeonly buffer Results { uint word[]; };
+layout(push_constant,std430) uniform Args { Source src; Results dst; uint count; };
+layout(local_size_x=128) in;
+shared uint token[128], used;
+void main(){
+    uint lane=gl_LocalInvocationIndex,i=gl_GlobalInvocationID.x,t=0xffffffffu;
+    if(i<count && (src.word[i*16u+12u]>>24u)!=0u){
+        uint b=src.word[i*16u+13u];
+        // FORCE_OPAQUE set and FORCE_NON_OPAQUE clear; other flags do not
+        // affect this predicate. Preserve every one of the 24 base bits.
+        t=(b&0xffffffu)|(((b>>24u)&12u)==4u?0u:0x1000000u);
+    }
+    if(lane==0u)used=0u;
+    token[lane]=t;barrier();
+    uint start=gl_WorkGroupID.x*129u;
+    if(t!=0xffffffffu && (lane==0u || t!=token[lane-1u])){
+        uint slot=atomicAdd(used,1u);
+        dst.word[start+1u+slot]=t;
+    }
+    barrier();
+    if(lane==0u)dst.word[start]=used;
+}
