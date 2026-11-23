@@ -6,15 +6,7 @@
 
 Frosty Bird is an unoffical, fan-led game runtime for Matrix Awaken's Xbox Series release on Linux. The game is fully playable from start to end, although there are still MAJOR graphical bugs.
 
-## Install and play
-
-Download **`FrostyBird-linux-x86_64.zip`** from the release assets, extract the
-entire folder, and run **`frostybird`**. Select your original Matrix Awakens
-package when prompted. The native C++ installer sets up Wine, registers the
-packaged movie decoder, and warms shaders and Vulkan pipelines on your GPU.
-When setup finishes, the game launches automatically. Later, run `frostybird`
-again or choose **Frosty Bird — The Matrix Awakens** in your applications menu.
-The player ZIP requires neither Python nor build tools.
+[Click here to download the latest release.](https://github.com/BeachesOfViceCity/FrostyBird/releases)
 
 > [!IMPORTANT]
 >
