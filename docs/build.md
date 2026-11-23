@@ -104,31 +104,3 @@ those existing trees to the locked upstream inputs.
 `FROSTY_DISTFILES` can point at a directory containing the named archives from
 the lock file; the same hashes are checked. For an offline build, also supply
 prepared recursive Git checkouts (`FROSTY_VKD3D_SOURCE`, `FROSTY_DXVK_SOURCE`).
-
-## Publishing the forks
-
-| Repository | What to publish |
-| --- | --- |
-| [Wine](https://github.com/wine-mirror/wine) | The Frosty branch, including the outstanding `mfplat`, `ntdll`, `winebus.sys` and `winhttp` changes. The patches here are relative to upstream `97027f879ba9`. |
-| [dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv) | **The additional fork.** Commit `opcodes/dxil/dxil_nvapi.cpp` on top of `34f0ff845eb7` and push a reachable child commit. It implements the checked compute subgroup-ordinal query. |
-| [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton) | Based on `cae8353ed795`. Include the backend changes, `libs/vkd3d/frosty_stage_cache.h`, and [the installer's synchronous cache writer](../patches/vkd3d-installer-cache.patch). Set the `subprojects/dxil-spirv` URL in `.gitmodules` to your fork, stage the submodule at the published child SHA, then commit and push the parent. `subprojects/.wraplock` is Meson-generated. |
-
-**No additional fork was found** in DXVK, Xodus `xgameruntime`, FFmpeg,
-libdeflate, Linux DXC, LLVM, Vulkan or the other graphics submodules. Xodus
-is built from upstream `642e41c76173` with its tests disabled; its GoogleTest
-checkout is not a runtime dependency. The FFmpeg adapter is maintained
-[here](../audio/ffmpeg/xma2frame.inc) and compiled into a private build copy.
-
-Before publishing, the default build already works from public upstream bases
-and the checked-in [patches](../patches/). After pushing the forks, build from
-their commits directly (no patch step) by setting these CMake cache variables:
-
-```sh
-cmake --preset runtime -B build-forks \
-  -DFROSTY_WINE_REPOSITORY="$WINE_FORK_URL" -DFROSTY_WINE_REVISION="$WINE_COMMIT" \
-  -DFROSTY_VKD3D_REPOSITORY="$VKD3D_FORK_URL" -DFROSTY_VKD3D_REVISION="$VKD3D_COMMIT"
-cmake --build build-forks --target frosty-runtime --parallel 2
-```
-
-Use full 40-character commit IDs. The child revision comes from the parent
-gitlink; the parent URL alone cannot publish an uncommitted submodule change.
